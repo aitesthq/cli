@@ -37,7 +37,7 @@
     "cli",
     "tdd"
   ],
-  "author": "Chijindu Azubuike",
+  "author": "AiTest HQ",
   "license": "MIT",
   "dependencies": {
     "@ai-sdk/anthropic": "^4.0.5",
