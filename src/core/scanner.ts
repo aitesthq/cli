@@ -1,0 +1,106 @@
+import { Project } from 'ts-morph';
+import { existsSync, readFileSync, statSync } from 'fs';
+import { resolve, dirname } from 'path';
+import { logger } from './logger.js';
+
+function resolveLocalPath(baseDir: string, moduleSpecifier: string): string | null {
+  let cleanedSpecifier = moduleSpecifier;
+  if (cleanedSpecifier.endsWith('.js')) {
+    cleanedSpecifier = cleanedSpecifier.replace(/\.js$/, '');
+  }
+
+  const exts = ['.ts', '.tsx', '.js', '.jsx', '/index.ts', '/index.js', '/index.tsx', '/index.jsx'];
+  const fullPath = resolve(baseDir, cleanedSpecifier);
+  
+  try {
+    const exactPath = resolve(baseDir, moduleSpecifier);
+    if (existsSync(exactPath) && statSync(exactPath).isFile()) {
+      return exactPath;
+    }
+  } catch(e) {}
+  
+  for (const ext of exts) {
+    const withExt = fullPath + ext;
+    try {
+      if (existsSync(withExt) && statSync(withExt).isFile()) {
+         return withExt;
+      }
+    } catch(e) {}
+  }
+  return null;
+}
+
+export function scanDependencies(filePath: string, maxTokens = 2000): string {
+  try {
+    const project = new Project();
+    const sourceFile = project.addSourceFileAtPath(filePath);
+    
+    let context = '';
+    const imports = sourceFile.getImportDeclarations();
+    const baseDir = dirname(filePath);
+    
+    for (const imp of imports) {
+      const moduleSpecifier = imp.getModuleSpecifierValue();
+      
+      // Skip node_modules or absolute built-in modules
+      if (!moduleSpecifier.startsWith('.') && !moduleSpecifier.startsWith('/')) {
+        continue;
+      }
+      
+      const resolvedPath = resolveLocalPath(baseDir, moduleSpecifier);
+      if (resolvedPath) {
+        const content = readFileSync(resolvedPath, 'utf-8');
+        context += `\n--- Related Context from ${moduleSpecifier} ---\n${content}\n`;
+        
+        if (context.length > maxTokens * 4) {
+          context = context.substring(0, maxTokens * 4) + '\n... [Context Truncated due to size limits]';
+          break;
+        }
+      }
+    }
+    
+    // Look for prisma schema to provide type context
+    const possiblePrismaPaths = [
+      resolve(process.cwd(), 'prisma/schema.prisma'),
+      resolve(process.cwd(), 'schema.prisma')
+    ];
+    for (const p of possiblePrismaPaths) {
+      if (existsSync(p)) {
+        const content = readFileSync(p, 'utf-8');
+        context += `\n--- Prisma Schema Context ---\n${content}\n`;
+        break; // Only include it once
+      }
+    }
+    
+    return context.trim();
+  } catch (error: any) {
+    logger.error(`Architecture Scanner failed for ${filePath}: ${error.message}`);
+    return '';
+  }
+}
+
+import fg from 'fast-glob';
+
+export async function generateWorkspaceMap(): Promise<string> {
+  try {
+    const files = await fg([
+      '**/*.{ts,js,tsx,jsx,json,prisma}',
+      '!**/node_modules/**',
+      '!**/dist/**',
+      '!**/build/**',
+      '!**/coverage/**'
+    ], { cwd: process.cwd(), dot: true });
+    
+    let mapStr = files.join('\n');
+    
+    // Hard limit the string length to prevent OpenAI API TPM / Token limit crashes.
+    // 5,000 characters is roughly ~1,250 tokens.
+    if (mapStr.length > 5000) {
+       mapStr = mapStr.substring(0, 5000) + '\n\n... [WORKSPACE MAP TRUNCATED DUE TO SIZE LIMIT].\nWARNING: The repository is too large to fit in this prompt. Use your `list_dir` tool to explore directories to find the exact file paths you need.';
+    }
+    
+    return mapStr;
+  } catch (error) {
+    return '';
+  }
+}

@@ -1,0 +1,556 @@
+import { AITestConfig } from '../core/config.js';
+import { ProjectInfo } from '../core/detector.js';
+import { askAI } from '../core/ai.js';
+import { runSingleTest } from '../core/runner.js';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import { writeFileSync, readFileSync, existsSync, readdirSync } from 'fs';
+import { resolve, dirname } from 'path';
+import { generateTestForFile } from '../commands/generate.js';
+import chalk from 'chalk';
+
+const execAsync = promisify(exec);
+
+type AgenticAction =
+  | { action: 'apply_patch'; file: string; code: string }
+  | { action: 'install_deps'; deps: string[] }
+  | { action: 'abort'; reason: string }
+  | { action: 'read_file'; path: string }
+  | { action: 'list_dir'; path: string };
+
+interface AgenticPlan {
+  reasoning: string;
+  steps: AgenticAction[];
+}
+
+/**
+ * AgenticPlanner – lightweight LLM‑driven planning wrapper.
+ *
+ * Workflow:
+ *   1️⃣ Generate an initial test (deterministic).
+ *   2️⃣ Run the test. If it passes we are done.
+ *   3️⃣ If it fails, ask the LLM for a **single‑step JSON plan** describing the next action.
+ *   4️⃣ Parse, validate, and execute the plan.
+ *   5️⃣ Loop up to a configurable max attempts (default 3).
+ */
+export class AgenticPlanner {
+  constructor(public config: AITestConfig, public projectInfo: ProjectInfo, public workspaceMap: string = '') {}
+
+  /** Detect if the AI provider is a cloud provider with a massive context window */
+  private _isCloudProvider(): boolean {
+    const p = (this.config.provider || '').toLowerCase();
+    return p.includes('deepseek') || p.includes('openai') || p.includes('anthropic') || p.includes('gemini') || p.includes('google');
+  }
+
+  /** Generate tests for a file using the LLM planning loop. */
+  async generateFile(
+    sourceFilePath: string,
+    options: { forceUpdate?: boolean; evaluateExisting?: boolean; workspaceMap?: string } = {}
+  ): Promise<'generated' | 'skipped' | 'failed'> {
+    const { forceUpdate = false, evaluateExisting = false } = options;
+
+    let isMassive = false;
+    let fileLength = 0;
+    try {
+      const content = readFileSync(sourceFilePath, 'utf-8');
+      fileLength = content.length;
+      isMassive = fileLength > 20000;
+    } catch(e) {}
+
+    let initialResult: 'generated' | 'skipped' | 'failed' = 'failed';
+
+    if (isMassive) {
+       console.log(chalk.yellow(`\n⚠ File ${sourceFilePath.split('/').pop()} is massive (${fileLength} chars). Engaging Agentic Chunking Generator...`));
+       initialResult = await this._runAgenticGeneratorLoop(sourceFilePath, this._deriveTestPath(sourceFilePath));
+    } else {
+       // 1️⃣ Create an initial test file using the existing generator.
+       initialResult = await generateTestForFile(
+         sourceFilePath,
+         this.config,
+         this.projectInfo,
+         forceUpdate,
+         evaluateExisting,
+         this.workspaceMap
+       );
+    }
+
+    if (initialResult === 'skipped') return 'skipped';
+    if (initialResult === 'failed') return 'failed';
+
+    // 2️⃣ Enter the repair loop for generation
+    return this._runAgenticLoop(this._deriveTestPath(sourceFilePath), sourceFilePath);
+  }
+
+  /** Run the agentic repair loop on an existing test file. */
+  async fixTestFile(testFilePath: string, sourceFilePath?: string): Promise<'generated' | 'skipped' | 'failed'> {
+    return this._runAgenticLoop(testFilePath, sourceFilePath);
+  }
+
+  private async _runAgenticGeneratorLoop(sourceFilePath: string, testFilePath: string): Promise<'generated' | 'skipped' | 'failed'> {
+    let attempts = 0;
+    const maxAttempts = 50; // Hard limit fallback to protect API billing
+    let stagnationCounter = 0;
+    let previousStepsHash = '';
+    let duplicateCount = 0;
+    let testCode = '';
+    const history: string[] = [];
+    let fileLines: string[] = [];
+    try {
+      fileLines = readFileSync(sourceFilePath, 'utf-8').split('\n');
+    } catch(e) {
+      return 'failed';
+    }
+    
+    // Seed test code with an empty string or existing file if it exists
+    if (existsSync(testFilePath)) {
+       testCode = readFileSync(testFilePath, 'utf-8');
+    } else {
+       writeFileSync(testFilePath, testCode, 'utf-8');
+    }
+
+    console.log(chalk.blue(`ℹ Starting Agentic Chunking Generator for ${sourceFilePath.split('/').pop()} (${fileLines.length} lines)...`));
+
+    while (attempts < maxAttempts) {
+      attempts++;
+      const plan = await this._requestGenPlan(testCode, testFilePath, sourceFilePath, fileLines.length, history);
+      if (!plan) {
+        console.log(chalk.red(`✖ AI failed to generate a valid generation plan.`));
+        return 'failed';
+      }
+
+      const currentStepsHash = JSON.stringify(plan.steps);
+      if (currentStepsHash === previousStepsHash) {
+        duplicateCount++;
+        if (duplicateCount >= 3) {
+          console.log(chalk.red(`✖ AI generated the exact same action 3 times in a row. Forcibly breaking loop.`));
+          break;
+        }
+      } else {
+        duplicateCount = 0;
+        previousStepsHash = currentStepsHash;
+      }
+
+      console.log(chalk.cyan(`🤖 AI Generator returned a plan:\n  🤔 Reasoning: ${plan.reasoning}`));
+      
+      let isFinished = false;
+      let madeProgress = false;
+      
+      for (const step of plan.steps) {
+        if (step.action === 'read_lines') {
+          console.log(chalk.cyan(`  - 📖 Reading lines ${step.start} to ${step.end}`));
+          const startIdx = Math.max(0, step.start - 1);
+          const endIdx = Math.min(fileLines.length, step.end);
+          const chunk = fileLines.slice(startIdx, endIdx).map((l, i) => `${startIdx + i + 1}: ${l}`).join('\n');
+          history.push(`Attempt ${attempts}: Read lines ${step.start}-${step.end}:\n${chunk}`);
+        } else if (step.action === 'search_file') {
+          console.log(chalk.cyan(`  - 🔍 Searching for "${step.query}"`));
+          const matches = fileLines
+             .map((line, idx) => ({ line, idx: idx + 1 }))
+             .filter(({ line }) => line.includes(step.query))
+             .slice(0, 30); // limit to 30 matches
+          const matchStr = matches.length > 0 ? matches.map(m => `Line ${m.idx}: ${m.line}`).join('\n') : 'No matches found.';
+          history.push(`Attempt ${attempts}: Searched for "${step.query}". Results:\n${matchStr}`);
+        } else if (step.action === 'append_test') {
+          console.log(chalk.cyan(`  - 📝 Appending test code chunk`));
+          testCode += '\n' + step.code;
+          writeFileSync(testFilePath, testCode, 'utf-8');
+          history.push(`Attempt ${attempts}: Appended test code.`);
+          madeProgress = true;
+        } else if (step.action === 'finish') {
+          console.log(chalk.green(`  - ✅ AI finished generating the test file.`));
+          history.push(`Attempt ${attempts}: Finished. Reason: ${step.reason}`);
+          isFinished = true;
+        }
+      }
+
+      if (isFinished) {
+         return 'generated';
+      }
+
+      if (madeProgress) {
+         stagnationCounter = 0;
+      } else {
+         stagnationCounter++;
+      }
+
+      if (stagnationCounter >= 10) {
+         console.log(chalk.red(`\n✖ AI exhausted 10 exploration attempts without making progress. Forcibly breaking loop.`));
+         break;
+      }
+      
+      // Wait a brief moment to avoid API spam
+      await new Promise(r => setTimeout(r, 500));
+    }
+    
+    if (attempts >= maxAttempts) {
+       console.log(chalk.yellow(`\n⚠ Reached maximum limit of ${maxAttempts} attempts. Safe breaking. To continue generating coverage, run the command again.`));
+    }
+    
+    return testCode.trim().length > 0 ? 'generated' : 'failed';
+  }
+
+  private async _requestGenPlan(testCode: string, testFilePath: string, sourceFilePath: string, totalLines: number, history: string[]): Promise<any | null> {
+    const historyContext = history.length > 0 ? `\n--- PREVIOUS ACTIONS & RESULTS ---\n${history.join('\n\n')}\n` : '';
+    const testFramework = this.projectInfo.testRunner === 'unknown' ? 'Jest' : this.projectInfo.testRunner;
+    
+    const isCloud = this._isCloudProvider();
+    const testLines = testCode.split('\n');
+    let testContext = '';
+    if (!isCloud && testLines.length > 500) {
+      const topLines = testLines.slice(0, 50).map((l, i) => `${i + 1}: ${l}`).join('\n');
+      const bottomLines = testLines.slice(-200).map((l, i) => `${testLines.length - 200 + i + 1}: ${l}`).join('\n');
+      testContext = `\n--- CURRENT TEST FILE PROGRESS (${testFilePath}) ---\n${topLines}\n... [${testLines.length - 250} lines omitted for Local LLM context support] ...\n${bottomLines}`;
+    } else {
+      const testCodeWithLines = testLines.map((l, i) => `${i + 1}: ${l}`).join('\n');
+      testContext = `\n--- CURRENT TEST FILE PROGRESS (${testFilePath}) ---\n${testCodeWithLines || '(Empty)'}`;
+    }
+
+    const prompt = `You are an expert QA engineer building a test suite for a massive file using an interactive chunking agent.
+--- TARGET FILE INFO ---
+File: ${sourceFilePath}
+Total Lines: ${totalLines}
+Test Framework: ${testFramework}
+${testContext}
+${historyContext}
+Your goal is to explore the target file chunk-by-chunk and incrementally build the test suite by appending test blocks.
+Based on the current progress, suggest ONE JSON plan describing your next steps. You can combine multiple actions in one plan.
+The JSON must follow this exact schema:
+{
+  "reasoning": "<explain what you are looking for or writing>",
+  "steps": [
+    { "action": "search_file", "query": "<string to search for, e.g. 'export function'>" }
+    | { "action": "read_lines", "start": <line number>, "end": <line number> }
+    | { "action": "append_test", "code": "<valid javascript/typescript test code block to append>" }
+    | { "action": "finish", "reason": "<explanation of completion>" }
+  ]
+}
+
+CRITICAL RULES:
+1. Do NOT wrap the JSON in markdown blocks. Output ONLY raw JSON.
+2. If you don't know where the functions are, use \`search_file\` with queries like "class ", "function ", or "module.exports" to find line numbers.
+3. Once you know the line numbers, use \`read_lines\` to read the implementation of a specific function (max 300 lines at a time).
+4. After reading the implementation, use \`append_test\` to write the test case(s) for that specific function.
+5. If using \`append_test\`, ensure the code is a complete block (e.g. \`describe('...', () => { ... })\`).
+6. When you have tested all major functions, use \`finish\`.`;
+
+    try {
+      const raw = await askAI(this.config, 'Generate a JSON plan for incremental test generation.', prompt);
+      const cleaned = raw.replace(/```json/g, '').replace(/```/g, '').trim();
+      const match = cleaned.match(/\{[\s\S]*\}/);
+      if (!match) return null;
+      return JSON.parse(match[0]);
+    } catch (error: any) {
+      console.log(chalk.red(`\n✖ AI generator request failed: ${error.message || error}`));
+      return null;
+    }
+  }
+
+  /** Core agentic reasoning loop for generating and fixing tests. */
+  private async _runAgenticLoop(testFilePath: string, sourceFilePath?: string): Promise<'generated' | 'skipped' | 'failed'> {
+    let attempts = 0;
+    const maxAttempts = this.config.maxRetries !== undefined ? this.config.maxRetries : 3;
+    let lastError = '';
+    let testCode = readFileSync(testFilePath, 'utf-8');
+    const history: string[] = [];
+    const recentPatches: string[] = []; // To detect loops
+    const fileLabel = sourceFilePath ? sourceFilePath.split('/').pop() : testFilePath.split('/').pop();
+
+    while (maxAttempts === -1 || attempts < maxAttempts) {
+      attempts++;
+      const result = await runSingleTest(testFilePath, this.projectInfo);
+      if (result.passed) {
+        if (attempts > 1) {
+          console.log(chalk.green(`\n✔ AI successfully fixed the test for ${fileLabel} after ${attempts - 1} attempt(s)!`));
+        } else {
+          console.log(chalk.green(`\n✔ Test ${fileLabel} passed successfully in isolation. No AI fixes were needed!`));
+        }
+        return 'generated';
+      }
+      
+      lastError = result.output;
+      const maxText = maxAttempts === -1 ? '∞' : maxAttempts;
+      console.log(chalk.yellow(`\n⚠ Test failed for ${fileLabel}. Requesting fix from AI (Attempt ${attempts} of ${maxText})...`));
+      
+      const snippet = lastError.split('\n').slice(0, 15).join('\n');
+      console.log(chalk.dim(`  Error Snippet:\n    ${snippet.replace(/\n/g, '\n    ')}`));
+
+      let explorationContext = '';
+      let explorationAttempts = 0;
+      let planExecuted = false;
+      let previousStepsHash = '';
+      let duplicateCount = 0;
+
+      while (explorationAttempts < 5 && !planExecuted) {
+        explorationAttempts++;
+        const plan = await this._requestPlan(lastError, testCode, testFilePath, history, sourceFilePath, explorationContext);
+        if (!plan) {
+          console.log(chalk.red(`✖ AI failed to generate a valid plan. Giving up on this file.`));
+          return 'failed';
+        }
+        
+        const currentStepsHash = JSON.stringify(plan.steps);
+        if (currentStepsHash === previousStepsHash) {
+          duplicateCount++;
+          if (duplicateCount >= 2) {
+            console.log(chalk.red(`✖ AI generated the exact same exploration action consecutively. Forcibly breaking loop.`));
+            break;
+          }
+        } else {
+          duplicateCount = 0;
+          previousStepsHash = currentStepsHash;
+        }
+
+        console.log(chalk.cyan(`🤖 AI returned a plan:`));
+        if (plan.reasoning) {
+          console.log(chalk.gray(`  🤔 Reasoning: ${plan.reasoning}`));
+        }
+        
+        let needsToBreakAndRunTests = false;
+        
+        for (const step of plan.steps) {
+          if (step.action === 'read_file') {
+            console.log(chalk.cyan(`  - 📖 Reading file: ${step.path}`));
+            try {
+              const content = readFileSync(resolve(process.cwd(), step.path), 'utf-8');
+              explorationContext += `\n--- READ FILE: ${step.path} ---\n${content}\n`;
+              history.push(`Attempt ${attempts} (Exploration ${explorationAttempts}): Read file ${step.path}`);
+            } catch (err: any) {
+              explorationContext += `\n--- FAILED TO READ FILE: ${step.path} ---\nError: ${err.message}\n`;
+              history.push(`Attempt ${attempts} (Exploration ${explorationAttempts}): Failed to read file ${step.path}`);
+            }
+          } else if (step.action === 'search_file') {
+            console.log(chalk.cyan(`  - 🔍 Searching for "${step.query}" in ${step.file}`));
+            try {
+              const content = readFileSync(resolve(process.cwd(), step.file), 'utf-8');
+              const matches = content.split('\n')
+                 .map((line, idx) => ({ line, idx: idx + 1 }))
+                 .filter(({ line }) => line.includes(step.query))
+                 .slice(0, 30);
+              const matchStr = matches.length > 0 ? matches.map(m => `Line ${m.idx}: ${m.line}`).join('\n') : 'No matches found.';
+              explorationContext += `\n--- SEARCH RESULTS FOR "${step.query}" IN ${step.file} ---\n${matchStr}\n`;
+              history.push(`Attempt ${attempts} (Exploration ${explorationAttempts}): Searched for "${step.query}" in ${step.file}`);
+            } catch (err: any) {
+              explorationContext += `\n--- FAILED TO SEARCH FILE: ${step.file} ---\nError: ${err.message}\n`;
+              history.push(`Attempt ${attempts} (Exploration ${explorationAttempts}): Failed to search file ${step.file}`);
+            }
+          } else if (step.action === 'read_lines') {
+            console.log(chalk.cyan(`  - 📖 Reading lines ${step.startLine}-${step.endLine} from ${step.file}`));
+            try {
+              const content = readFileSync(resolve(process.cwd(), step.file), 'utf-8');
+              const lines = content.split('\n');
+              const startIdx = Math.max(0, step.startLine - 1);
+              const endIdx = Math.min(lines.length, step.endLine);
+              const chunk = lines.slice(startIdx, endIdx).map((l, i) => `${startIdx + i + 1}: ${l}`).join('\n');
+              explorationContext += `\n--- READ LINES ${step.startLine}-${step.endLine} FROM ${step.file} ---\n${chunk}\n`;
+              history.push(`Attempt ${attempts} (Exploration ${explorationAttempts}): Read lines ${step.startLine}-${step.endLine} from ${step.file}`);
+            } catch (err: any) {
+              explorationContext += `\n--- FAILED TO READ LINES: ${step.file} ---\nError: ${err.message}\n`;
+              history.push(`Attempt ${attempts} (Exploration ${explorationAttempts}): Failed to read lines from ${step.file}`);
+            }
+          } else if (step.action === 'list_dir') {
+            console.log(chalk.cyan(`  - 📂 Listing directory: ${step.path}`));
+            try {
+              const files = readdirSync(resolve(process.cwd(), step.path));
+              explorationContext += `\n--- DIRECTORY: ${step.path} ---\n${files.join('\n')}\n`;
+              history.push(`Attempt ${attempts} (Exploration ${explorationAttempts}): Listed directory ${step.path}`);
+            } catch (err: any) {
+              explorationContext += `\n--- FAILED TO LIST DIRECTORY: ${step.path} ---\nError: ${err.message}\n`;
+              history.push(`Attempt ${attempts} (Exploration ${explorationAttempts}): Failed to list directory ${step.path}`);
+            }
+          } else if (step.action === 'replace_lines') {
+            needsToBreakAndRunTests = true;
+            console.log(chalk.cyan(`  - 📝 Replace lines ${step.startLine}-${step.endLine} in ${step.file.split('/').pop()}`));
+            history.push(`Attempt ${attempts}: Replaced lines ${step.startLine}-${step.endLine} in ${step.file.split('/').pop()}`);
+            
+            // Anti-loop safeguard: If AI applies the exact same code 3 times, hard abort.
+            recentPatches.push(step.replacementCode);
+            if (recentPatches.length > 3) recentPatches.shift();
+            if (recentPatches.length === 3 && recentPatches.every(code => code === step.replacementCode)) {
+               console.log(chalk.red(`✖ AI generated the exact same patch 3 times in a row. Forcibly breaking infinite loop.`));
+               return 'failed';
+            }
+          } else if (step.action === 'install_deps') {
+            needsToBreakAndRunTests = true;
+            console.log(chalk.cyan(`  - 📦 Install dependencies: ${step.deps.join(', ')}`));
+            history.push(`Attempt ${attempts}: Installed dependencies ${step.deps.join(', ')}`);
+          } else if (step.action === 'abort') {
+            needsToBreakAndRunTests = true;
+            console.log(chalk.cyan(`  - 🛑 Abort: ${step.reason}`));
+            history.push(`Attempt ${attempts}: Aborted with reason: ${step.reason}`);
+            
+            if (sourceFilePath) {
+              const bugFile = resolve(process.cwd(), 'aitest-bugs.md');
+              const fs = await import('fs');
+              fs.appendFileSync(bugFile, `\n## Source Code Issue Detected in ${sourceFilePath}\n**AI Reasoning**: ${plan.reasoning || 'No reasoning provided.'}\n**Abort Reason**: ${step.reason}\n`, 'utf-8');
+              console.log(chalk.yellow(`  ⚠ Issue logged to aitest-bugs.md for later fixing.`));
+            }
+          }
+        }
+
+        if (needsToBreakAndRunTests) {
+          // 4️⃣ Execute the plan.
+          const execResult = await this._executePlan(plan);
+          if (execResult === 'abort') {
+            console.log(chalk.red(`✖ AI plan execution aborted.`));
+            return 'skipped';
+          }
+          planExecuted = true;
+        } else {
+          // It just explored! Wait a brief moment before looping to avoid slamming the API too fast
+          await new Promise(r => setTimeout(r, 500));
+        }
+      }
+      
+      if (!planExecuted) {
+          console.log(chalk.red(`✖ AI exhausted exploration limit without applying a patch. Giving up on this file.`));
+          return 'failed';
+      }
+
+      // Reload test code after a possible patch.
+      if (existsSync(testFilePath)) {
+        testCode = readFileSync(testFilePath, 'utf-8');
+      }
+    }
+    
+    console.log(chalk.red(`\n✖ Exhausted ${maxAttempts} AI attempts without passing.`));
+    return 'failed'; // exhausted attempts
+  }
+
+  /** Derive the .test.* filename from a source file path. */
+  private _deriveTestPath(sourceFilePath: string): string {
+    const ext = sourceFilePath.substring(sourceFilePath.lastIndexOf('.'));
+    const base = sourceFilePath.substring(
+      sourceFilePath.lastIndexOf('/') + 1,
+      sourceFilePath.length - ext.length
+    );
+    const dir = dirname(sourceFilePath);
+    return resolve(dir, `${base}.test${ext}`);
+  }
+
+  /** Prompt the LLM for a JSON plan based on a failed test run. */
+  private async _requestPlan(errorOutput: string, testCode: string, testFilePath: string, history: string[], sourceFilePath?: string, explorationContext: string = ''): Promise<AgenticPlan | null> {
+    const historyContext = history.length > 0 ? `\n--- PREVIOUS ACTIONS TAKEN ---\n${history.join('\n')}\nWARNING: The test is still failing. Do NOT suggest the exact same action again.` : '';
+    let sourceContext = '';
+    if (sourceFilePath && existsSync(sourceFilePath)) {
+      const sourceContent = readFileSync(sourceFilePath, 'utf-8');
+      const sourceLines = sourceContent.split('\n');
+      if (sourceLines.length > 1000) {
+        sourceContext = `\n--- SOURCE FILE INFO ---\nThe source file (${sourceFilePath}) is massive (${sourceLines.length} lines) and has been omitted from this prompt to save context and improve accuracy. You MUST use the "search_file" and "read_lines" actions to dynamically read the specific functions you need to fix the test.`;
+      } else {
+        sourceContext = `\n--- SOURCE FILE (${sourceFilePath}) ---\n${sourceContent}`;
+      }
+    }
+    const workspaceContext = this.workspaceMap ? `\n--- WORKSPACE FILE STRUCTURE ---\n${this.workspaceMap}` : '';
+    const explorationContextString = explorationContext ? `\n--- EXPLORATION CONTEXT ---\n${explorationContext}` : '';
+    
+    const isCloud = this._isCloudProvider();
+    const testLines = testCode.split('\n');
+    let testContext = '';
+    
+    if (!isCloud && testLines.length > 500) {
+      testContext = `\n--- TEST FILE INFO ---\nThe test file (${testFilePath}) is massive (${testLines.length} lines) and has been omitted to support Local LLMs. Look at the ERROR OUTPUT to find the line number of the failing test (e.g., file.test.js:6540). You MUST use the "read_lines" action to read the test file around that line number before applying a "replace_lines" patch.`;
+    } else {
+      const testCodeWithLines = testLines.map((line, idx) => `${idx + 1}: ${line}`).join('\n');
+      testContext = `\n--- TEST FILE (${testFilePath}) ---\n${testCodeWithLines}`;
+    }
+
+    const prompt = `You are an expert QA engineer. The following test has failed.${sourceContext}${workspaceContext}${explorationContextString}${testContext}
+--- ERROR OUTPUT ---
+${errorOutput}${historyContext}
+Based on this information, suggest ONE JSON plan describing the next actionable step. The JSON must follow this schema:
+{ "reasoning": "<explain the failure and your fix or exploration strategy>", "steps": [ { "action": "replace_lines", "file": "${testFilePath}", "startLine": <number>, "endLine": <number>, "replacementCode": "<new test code to replace the specified lines>" } | { "action": "search_file", "file": "<path>", "query": "<string to search for>" } | { "action": "read_lines", "file": "<path>", "startLine": <number>, "endLine": <number> } | { "action": "read_file", "path": "<relative path to file>" } | { "action": "list_dir", "path": "<relative path to dir>" } | { "action": "install_deps", "deps": ["<package>"] } | { "action": "abort", "reason": "<text>" } ] }
+CRITICAL RULES:
+1. To explore massive files safely, use "search_file" to find function signatures, then "read_lines" to read the implementation block. For small files, use "read_file". If you need to see what files exist in a directory, use "list_dir".
+2. You may ONLY patch the test file (${testFilePath}) using the "replace_lines" action.
+3. For "replace_lines", provide the exact startLine and endLine numbers based on the line numbers shown in the TEST FILE block. To insert code without removing any lines, set startLine and endLine to the line number where you want to insert.
+4. Do NOT wrap the JSON in markdown code blocks. Output ONLY the raw JSON object.
+5. If you cannot fix the issue, return an "abort" action.`;
+    try {
+      const raw = await askAI(this.config, 'Generate a JSON plan to fix the failing test.', prompt);
+      const plan = this._parsePlan(raw);
+      if (plan && this._validatePlan(plan, testFilePath)) return plan;
+      return null;
+    } catch (error: any) {
+      console.log(chalk.red(`\n✖ AI request failed: ${error.message || error}`));
+      return null;
+    }
+  }
+
+  /** Extract JSON from LLM response and parse it. */
+  private _parsePlan(text: string): AgenticPlan | null {
+    try {
+      const cleaned = text.replace(/```json/g, '').replace(/```/g, '').trim();
+      const match = cleaned.match(/\{[\s\S]*\}/);
+      if (!match) return null;
+      const obj = JSON.parse(match[0]);
+      if (obj && Array.isArray(obj.steps)) return obj as AgenticPlan;
+    } catch (e) {
+      // malformed JSON
+    }
+    return null;
+  }
+
+  /** Validate that the plan only contains allowed actions and safe file paths. */
+  private _validatePlan(plan: AgenticPlan, testFilePath: string): boolean {
+    const allowed = new Set(['replace_lines', 'install_deps', 'abort', 'read_file', 'list_dir', 'search_file', 'read_lines']);
+    for (const step of plan.steps) {
+      if (!allowed.has(step.action)) return false;
+      if (step.action === 'replace_lines') {
+        const abs = resolve(step.file);
+        if (abs !== testFilePath) return false; // Strictly enforce only patching the test file
+        if (typeof (step as any).startLine !== 'number') return false;
+        if (typeof (step as any).endLine !== 'number') return false;
+        if (typeof (step as any).replacementCode !== 'string') return false;
+      }
+      if (step.action === 'install_deps') {
+        if (!Array.isArray((step as any).deps)) return false;
+      }
+      if (step.action === 'read_file' || step.action === 'list_dir') {
+        if (typeof (step as any).path !== 'string') return false;
+      }
+      if (step.action === 'search_file') {
+        if (typeof (step as any).file !== 'string') return false;
+        if (typeof (step as any).query !== 'string') return false;
+      }
+      if (step.action === 'read_lines') {
+        if (typeof (step as any).file !== 'string') return false;
+        if (typeof (step as any).startLine !== 'number') return false;
+        if (typeof (step as any).endLine !== 'number') return false;
+      }
+    }
+    return true;
+  }
+
+  /** Execute a validated plan step‑by‑step. */
+  private async _executePlan(plan: AgenticPlan): Promise<'continue' | 'abort'> {
+    for (const step of plan.steps) {
+      switch (step.action) {
+        case 'replace_lines': {
+          const fileContent = existsSync(step.file) ? readFileSync(step.file, 'utf-8') : '';
+          const lines = fileContent.split('\n');
+          const startIdx = Math.max(0, step.startLine - 1);
+          const endIdx = Math.min(lines.length, step.endLine);
+          
+          const newLines = (step as any).replacementCode.split('\n');
+          lines.splice(startIdx, endIdx - startIdx, ...newLines);
+          
+          writeFileSync(step.file, lines.join('\n'), 'utf-8');
+          break;
+        }
+        case 'install_deps': {
+          const deps = (step as any).deps.join(' ');
+          try {
+            await execAsync(`npm install --save-dev ${deps}`, { cwd: process.cwd() });
+          } catch (e) {
+            return 'abort';
+          }
+          break;
+        }
+        case 'abort': {
+          return 'abort';
+        }
+      }
+    }
+    return 'continue';
+  }
+}
